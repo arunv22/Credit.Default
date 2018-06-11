@@ -1,0 +1,351 @@
+---
+title: "Credit.Default.Final"
+author: "Arun"
+date: "June 11, 2018"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+Background
+
+Bank ABC wants to predict app score for current credit card customers.
+The app score will denote a customer's credit worthiness and help the bank in reducing credit default risk.
+
+Data Explanation
+
+Account_Segment:customer's historical accounts data and payment
+behavior history.
+
+Enquiry_Segment:customer's historical enquiry data such as enquiry amount,and enquiry purpose.
+
+Data: Current customer applications with demographic data.
+
+Data given for April-Dec 2015.
+
+We have 6 different csv files,2 for each account,enquiry and data; data points are splitted in 70:30 ratio and available in separate csv files. 
+
+Target variable is Bad_label in data file; primary key is customer_no; in total 34136 customer data are available; 23896 in train file and 10240 in test. 
+
+Let'us load all the file into R and I have combined train and test set into single dataframe solely for the purpose of generating similar features and other data munging processes in one go.
+
+customer_no in test data file has customer_no starting from 1 which could get confused with customer_no in train file. Hence I have reassigned customer_no in test file to next number sequence of train file. i.e if the last customer_no is 10 in train file; customer_no=1 in test file will be assigned 11(10+1).  
+
+Loading the required library
+```{r credit default,include=FALSE}
+library(tidyverse)
+library(lubridate)
+library(magrittr)
+library(caret)
+library(randomForest)
+library(missForest)
+```
+Seperate chunk to load raw files; joined train and test sheet into single dataframe.  
+```{r load_files,include=FALSE}
+account_70 <- read.csv("D:/Cibil/test data/raw_account_70_new.csv",stringsAsFactors = T)
+data_70 <- read.csv("D:/Cibil/test data/raw_data_70_new.csv",stringsAsFactors = T)
+enquiry_70 <- read.csv("D:/Cibil/test data/raw_enquiry_70_new.csv",stringsAsFactors = T)
+
+account_30 <- read.csv("D:/Cibil/test data/raw_account_30_new.csv",stringsAsFactors = T)
+data_30 <- read.csv("D:/Cibil/test data/raw_data_30_new.csv",stringsAsFactors = T)
+enquiry_30 <- read.csv("D:/Cibil/test data/raw_enquiry_30_new.csv",stringsAsFactors = T)
+
+
+account<-rbind(account_70,account_30)
+data<-rbind(data_70,data_30)
+enquiry<-rbind(enquiry_70,enquiry_30)
+
+```
+## Structure of the data
+The account dataset has 265897 rows and 21 features with customer_no as key
+The data dataset has 34136 rows and 83 features with customer_no as key
+The enquiry dataset has 586687 rows and 6 variables with customer_no as key
+
+```{r glimpse}
+glimpse(data)
+glimpse(account)
+glimpse(enquiry)
+```
+First we will make necessary changes in each dataset one by one.
+Data dataset has features with names like feature_1,feature_2 etc. without explicitly specifying the feature name, which adds ambiguity. It is always better to eliminate features that seems to have zero variance or features like phone number or PAN Details whose details for each customers are masked.
+```{r data.clean}
+cols_to_discard=c("feature_5","feature_6","feature_10","feature_20","feature_22"
+                  ,"feature_24","feature_14","feature_44","feature_45",
+                  "feature_46","feature_47","feature_49","feature_61",
+                  "feature_70","feature_4","feature_38","feature_9",
+                  "feature_31","feature_28","feature_63","feature_77"
+                  )                  
+cols_to_character=c("dt_opened","entry_time","feature_2",
+                    "feature_53","feature_54",
+                    "feature_15","feature_16","feature_17","feature_18",
+                    "feature_21","feature_75")
+cols_to_factor=c("feature_19","feature_25",
+                 "feature_26","feature_34","feature_67","feature_68",
+                 "feature_74","feature_76","feature_78","Bad_label")
+
+data<-data %>% select(-one_of(cols_to_discard))
+data[,cols_to_factor] <- lapply(data[,cols_to_factor],as.factor)
+data[,cols_to_character]<-lapply(data[,cols_to_character], as.character)
+
+```
+Summary statistics for numeric column and frequency table for factor columns
+
+```{r summary,eval=FALSE}
+
+lapply(data, function(x) {
+  
+  if (is.numeric(x)) return(summary(x))
+  
+  if (is.factor(x)) return(table(x))
+  
+})
+
+```
+The target variable Bad_label has only 4% as bad account(Bad_label=1) and the rest 96% is classified as not a bad account(Bad_label=0);a case of imbalanced dataset.
+
+```{r bad_label}
+data%>%count(Bad_label)%>%mutate(freq=n/sum(n))
+ggplot(data=data)+geom_bar(mapping=aes(x=Bad_label),position = "dodge")
+
+```
+Feature Engineering.
+
+I have decided to start with given feature creation in Test Questionnaire.Most of the new features requires aggregrating the feature across each customer_no so that it can be later joined with the 'data' dataset for building final model.
+
+From the enquiry dataset, you can count how many times a customer's CIBIL score has been enquired by the lender bank for approving any loan.Feature names are 1.count_enquiry_recency_90, 2.count_enquiry_recency_365.
+
+```{r enquiry_recency,eval=FALSE}
+enquiry<-enquiry%>%mutate(dt_opened=dmy(dt_opened),
+                 enquiry_dt=dmy(enquiry_dt),recency=dt_opened-enquiry_dt)
+
+count_enquiry_365<-enquiry%>%group_by(customer_no)%>%filter(recency<=365)%>%
+  tally()
+data=left_join(data,count_enquiry_365)
+colnames(data)[colnames(data) == 'n'] <- 'count_enquiry_365'
+data$count_enquiry_365[is.na(data$count_enquiry_365)]<-0
+
+count_enquiry_90<-enquiry%>%group_by(customer_no)%>%
+  filter(recency<=90)%>%tally()
+data=left_join(data,count_enquiry_90)
+colnames(data)[colnames(data) == 'n'] <- 'count_enquiry_90'
+data$count_enquiry_90[is.na(data$count_enquiry_90)]<-0
+```
+Account sheet has an important feature called payment history which records the customer's payment history pattern for the past 3 years(36months) of all accounts of the customer; i.e it has DPD (Days Past Due);DPD indicates how many days a payment on that account is late by that month. Anything but "000" or "STD" is considered negative by the lender.Standard (STD) implies payments being made within 90 days."XXX" on your DPD for a certain account implies that information for these months has not been reported to CIBIL by the banks.
+
+I have attempted here to clean,concatenate and split the payment history column into seperate 36 columns. Feature generated are 1.total_diff_lastpaymt_opened_dt
+2.mean_diff_lastpaymt_opened_dt 3. payment_history_mean_length 4.payment_history_avg_dpd_0_29_bucket 5.min_months_last_30_plus 6.count_0 7.count_XXX 8.count_STD 9.count_dpd_0_29 10.months_last_30_plus 11.paymenthistory_length
+
+```{r paymenthistory split,eval=FALSE}
+account$paymenthistory1=str_replace_all(account$paymenthistory1, 
+                                        pattern = "[[:punct:]]", "")
+account$paymenthistory2=str_replace_all(account$paymenthistory2, 
+                                        pattern = "[[:punct:]]", "")
+account$paymenthistory2[is.na(account$paymenthistory2)]<-""
+account$paymenthistory<-paste(account$paymenthistory1,account$paymenthistory2,sep="")
+
+account$paymenthistory_length=nchar(account$paymenthistory)/3
+
+splitInParts <- function(string, size){
+  pat <- paste0('(?<=.{',size,'})')
+  strsplit(string, pat, perl=TRUE)
+}
+
+account$paymenthistory_split<-splitInParts(account$paymenthistory,3)
+
+g2 <- mapply(function(y) lapply(account$paymenthistory_split, 
+                                function (x) x[y]), 
+             1:lengths(account$paymenthistory_split)[1])
+g3<-as.data.frame(g2)
+
+colnames(g3) <- paste0("Payment_history_", 1:36)
+
+account=cbind(account,g3)
+```
+Recoding the strings in DPD columns to numeric makes sense when we need to create new features based on numerical filters and comparisions.
+#XXX as -99
+#STD as -900
+#NA as -999
+
+
+```{r recode payment history,eval=FALSE}
+var=paste0("Payment_history_",1:36)
+account[,var][account[,var]=="XXX"]<-"-99"
+account[,var][account[,var]=="STD"]<-"90"
+account[,var][is.na(account[,var])]<-"-999"
+
+account[,var]=as.numeric(unlist(account[,var]))
+```
+Features based on count/occurence of number of 0's,XXX,STD,dpd within 30 days are generated and aggregrated in customer_no level which summarises new features that can be joined with the 'data' sheet like number of account each customer holded,payment history mean length etc.
+
+```{r account new feature,eval=FALSE}
+#account$b=apply(account[,var],1,function(x) min(which(x !=0)))
+account<-account%>%mutate(last_paymt_dt=dmy(last_paymt_dt),
+                 opened_dt=dmy(opened_dt),
+                 total_diff_lastpaymt_opened_dt=last_paymt_dt-opened_dt)
+ account$count_0<-rowSums(account[,var] == 0,na.rm = T)
+ account$count_XXX<-rowSums(account[,var]== -99,na.rm=T)
+ account$count_STD<-rowSums(account[,var]== -900,na.rm = T)
+ account$count_dpd_0_29<-rowSums(account[,var]>=0 & account[,var]<=29,na.rm=T)
+ 
+ tot_Acc<-account%>%group_by(customer_no)%>%
+  summarise(total_account=n(),
+            total_diff_lastpaymt_opened_dt=sum(total_diff_lastpaymt_opened_dt,
+                                               na.rm=T),
+            mean_diff_lastpaymt_opened_dt=total_diff_lastpaymt_opened_dt/
+              total_account,
+            payment_history_mean_length=mean(paymenthistory_length,na.rm=T),
+            payment_history_avg_dpd_0_29_bucket=mean(count_dpd_0_29,na.rm = T))
+            #,avg_min_months_not0=mean(b,na.rm=T)
+data=left_join(data,tot_Acc)
+
+
+```
+
+Features like utilisation trend and ratio_currbalance are summarised and joined with the 'data'. 
+
+```{r utilisation,eval=FALSE}
+summary_trend<-account%>%group_by(customer_no)%>%
+  summarise(total_account=n(),
+            total_cur_bal_amt = sum(cur_balance_amt,na.rm = T),
+            total_credit_limit=sum(creditlimit,na.rm = T),
+            mean_cur_bal_amt=total_cur_bal_amt/total_account,
+            mean_credit_limit=total_credit_limit/total_account,
+            mean_cash_limit=sum(cashlimit,na.rm = T)/total_account,
+            utilisation_trend=(total_cur_bal_amt/total_credit_limit)/                             (mean_cur_bal_amt/(mean_credit_limit+mean_cash_limit)),
+            Ratio_currbalance_creditlimit=(total_cur_bal_amt/
+                                             total_credit_limit))%>%ungroup()
+data=left_join(data,summary_trend)
+
+```
+'data' sheet now has good amount of features added to it. Next challenge would be handling missing value which includes Na's, Inf, and blanks.Feature56 and Feature64 are found duplicate.There are some rows which has a whole lot of NA's (24 rows out of 34136 are like this). Ideal case would be to remove these from the analysis; but it can cause loss of information from the test data; mismatch in number of rows in test data affects the solution.
+Most of the demographic features were found to be non informative  as column labels are missing though one can go for wild guess to rename some as date of birth,gender etc. I would initially go without including categorical features in demographic data as it is difficult to handle categorical features with missing values in the model space and require dummy variable generation and missing imputation by most frequent classes etc.
+
+Missing value in 'data' is quite high in number and a worrying factor;handling missing data with simple imputation such as replacing it with mean,mode etc. can distort the entire 'data' pattern because of its imbalance classes. 
+
+Loading the transformed 'data' again. 
+Filtering only numeric columns for the baseline model.
+Train,test split just like in the initial raw files; initial 23896 rows to train and rest to test.
+I have used a randomforest kind of imputation for the missing values in the filtered column.
+rf method from caret package is used to build the classification model.
+
+
+
+
+```{r model,eval=FALSE}
+df <- read.csv("D:/Cibil/test data/Cibil_3.csv",stringsAsFactors = T,
+                   na.strings = c("", "NA","Inf"))
+
+filtr<-c(2,5,19,32,38:53)
+df1<-df%>%select(filtr)
+df1$Ratio_currbalance_creditlimit=
+  as.numeric(as.character(df1$Ratio_currbalance_creditlimit))
+df1$total_diff_lastpaymt_opened_dt=
+  as.numeric(as.character(df1$total_diff_lastpaymt_opened_dt))
+train_data<-df1[1:23896,]
+test_data<-df1[23897:34136,]
+
+df1<-missForest(df1,maxiter = 2,ntree = 10,verbose = T)
+df1 <- df1$ximp
+
+train_data<-df1[1:23896,]
+test_data<-df1[23897:34136,]
+
+
+
+
+model_rf <- caret::train(Bad_label ~ .,
+                         data = train_data,
+                         method = "rf",
+                         preProcess = c("scale", "center"),
+                         trControl = trainControl(method = "repeatedcv",
+                                                  number = 2,
+                                                  repeats = 2,
+                                                  verboseIter = FALSE))
+
+final <- data.frame(actual = test_data$Bad_label,
+                    predict(model_rf, newdata = test_data, type = "prob"))
+final$predict <- ifelse(final$X1 > 0.5, 1,0)
+```
+```{r confusion_matrix,eval=FALSE}
+final<-
+cm_original <- confusionMatrix(table(final$predict, test_data$Bad_label))
+cm_original
+```
+
+```{r correlation}
+varImp(model_rf)
+
+```
+
+```{r model_2}
+df <- read.csv("D:/Cibil/test data/Cibil_3.csv",stringsAsFactors = T,
+               na.strings = c("", "NA","Inf"))
+
+
+filtr1<-c(5,19,32,39:53)
+df2<-df%>%select(filtr1)
+summary(df2)
+df2$Ratio_currbalance_creditlimit=
+  as.numeric(as.character(df2$Ratio_currbalance_creditlimit))
+df2$total_diff_lastpaymt_opened_dt=
+  as.numeric(as.character(df2$total_diff_lastpaymt_opened_dt))
+#Replace Outlier
+fun <- function(x){
+  quantiles <- quantile( x, c(.05, .95 ),na.rm = T )
+  x[ x < quantiles[1] ] <- quantiles[1]
+  x[ x > quantiles[2] ] <- quantiles[2]
+  x
+}
+df3=fun(df2)
+
+df3_imputed<-mice(df3,m=1,maxit = 5,method = 'pmm',seed = 500)
+df3_complete<-complete(df3_imputed)
+colSums(is.na(df3_complete))
+summary(df3_imputed)
+train_data_1<-df3_complete[1:23896,]
+train_data_1<-cbind(train_data_1,train_data$Bad_label,train_data$customer_no)
+test_data_1<-df3_complete[23897:34136,]
+test_data_1<-cbind(test_data_1,test_data$Bad_label)
+
+model_rf_2 <- caret::train(Bad_label ~ .,
+                         data = train_data_1,
+                         method = "rf",
+                         preProcess = c("scale", "center"),
+                         trControl = trainControl(method = "repeatedcv",
+                                                  number = 2,
+                                                  repeats = 2,
+                                                  verboseIter = FALSE))
+p<-predict(model_rf_2)
+
+final_2 <- data.frame(actual = test_data_1$Bad_label,
+                    predict(model_rf_2, newdata = test_data_1, type = "prob"))
+final_2$predict <- ifelse(final_2$X1 > 0.07, 1,0)
+cm_original_1 <- confusionMatrix(table(final_2$predict, test_data_1$Bad_label))
+cm_original_1
+varImp(model_rf_2)
+
+pred <- prediction(predict(model_rf_2, newdata = test_data_1, type = "prob"), test_data_1$Bad_label)
+perf <- performance(pred, "tpr","fpr") 
+plot(perf, col=rainbow(10))
+rf.pr<-predict(model_rf_2,type="prob",newdata = test_data_1)[,2]
+pred<-prediction(rf.pr,test_data_1$Bad_label)
+auc <- performance(pred,"auc")
+auc <- unlist(slot(auc, "y.values"))
+
+cutoffs <- data.frame(cut=perf@alpha.values[[1]], fpr=perf@x.values[[1]], 
+                      tpr=perf@y.values[[1]])
+
+cutoffs <- cutoffs[order(cutoffs$tpr, decreasing=TRUE),]
+head(subset(cutoffs, fpr < 0.8))
+cutoffs[findInterval(0.5, cut$tpr), 'cut']
+
+predictions<-as.vector(model_rf_2$votes[,2])
+pred<-prediction(predictions,test_data_1[,c('Bad_label')])
+
+
+
+
+
+getTrainPerf(model_rf_2)
+```
